@@ -1,6 +1,6 @@
-# MSc thesis
+# MSc Project
 
-**Masters in Biomedical Engineering Dissertation**
+**Masters in Biomedical Engineering Individual Project**
 
 **TITLE:** Automatic Knee Cartilage Segmentation based on Non-contrastive Self-Supervised Learning Methods
 
