@@ -1,58 +1,136 @@
+import tensorflow as tf
+import os
+
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# ##########  Use TPU
+resolver = tf.distribute.cluster_resolver.TPUClusterResolver(tpu='local')
+tf.config.experimental_connect_to_cluster(resolver)
+tf.tpu.experimental.initialize_tpu_system(resolver)
+print("All devices: ", tf.config.list_logical_devices('TPU'))
+strategy = tf.distribute.TPUStrategy(resolver)
+
 from tensorflow.keras import layers
 import tensorflow_addons as tfa
 from tensorflow import keras
-import tensorflow as tf
-
+import matplotlib.pyplot as plt
 import numpy as np
-# import random
+from keras_cv_attention_models.attention_layers import CompatibleExtractPatches
+from data_loader import read_tfrecord_2d, read_tfrecord_3d
 from Blocks.UNETR import UnetrBasicBlock, UnetrPrUpBlock, UnetrUpBlock
+
+LESS_RATIO = 1
+EPOCHS = 100
+BUFFER_SIZE = 1024
+BATCH_SIZE = 64
+AUTO = tf.data.AUTOTUNE
+
+
+# linear = True
+def load_datasets(batch_size, buffer_size,
+                  tfrec_dir='gs://oai-challenge-us/tfrecords/',
+                  ):
+    """
+    Loads tf records datasets for 2D models.
+    """
+    args = {
+        'batch_size': batch_size,
+        'buffer_size': buffer_size,
+    }
+    train_ds = read_tfrecord_2d(tfrecords_dir=os.path.join(tfrec_dir, 'train'),
+                                batch_size=batch_size,
+                                buffer_size=buffer_size,
+                                augmentation=None,
+                                is_training=True,
+                                multi_class=True,
+                                less_ratio=LESS_RATIO)
+    valid_ds = read_tfrecord_2d(tfrecords_dir=os.path.join(tfrec_dir, 'valid'),
+                                batch_size=batch_size,
+                                buffer_size=buffer_size,
+                                augmentation=None,
+                                is_training=False,
+                                multi_class=True)
+    return train_ds, valid_ds
+
+
+# tfrecords_dir = "gs://oai-challenge-us/tfrecords/train"
+# file_list = tf.io.matching_files(os.path.join(tfrecords_dir, '*-*'))
+# print('file_list', file_list)
+# tfrec_dir = 'gs://oai-challenge-us/tfrecords'
+# train_ds, valid_ds = load_datasets(BATCH_SIZE, BUFFER_SIZE, tfrec_dir)
+# print('train_ds',train_ds)
+# print('valid_ds',valid_ds)
+
+
+def parse_tf_img(element):
+    image_feature_description = {
+        "width": tf.io.FixedLenFeature([], dtype=tf.int64),
+        "label_raw": tf.io.FixedLenFeature([], dtype=tf.string),
+        "image_raw": tf.io.FixedLenFeature([], dtype=tf.string),
+        "num_channels": tf.io.FixedLenFeature([], dtype=tf.int64),
+        "height": tf.io.FixedLenFeature([], dtype=tf.int64), }
+    parsed_example = tf.io.parse_single_example(element, image_feature_description)
+    width = parsed_example['width']
+    height = parsed_example['height']
+    num_channels = parsed_example['num_channels']
+    image = parsed_example['image_raw']
+    image = tf.compat.v1.decode_raw(image, tf.float32)
+    image = tf.reshape(image, [384, 384, 1])
+    #   image = tf.cast(tf.round((image / tf.reduce_max(image)) * 255), tf.uint8)
+    #   image = tf.cast((np.round(image)), tf.uint8)
+    #   image = tf.cast((image-tf.reduce_mean(image)) / (tf.reduce_max(image)-tf.reduce_min(image)), tf.float32)
+    #   image = tf.cast(image / tf.maximum(image)), tf.float32)
+    mask = parsed_example['label_raw']
+    mask = tf.compat.v1.decode_raw(mask, tf.int16)
+    mask = tf.reshape(mask, [384, 384, 7])
+    mask = tf.cast(mask, tf.float32)
+    image = tf.image.resize_with_crop_or_pad(image, 288, 288)
+    mask = tf.image.resize_with_crop_or_pad(mask, 288, 288)
+
+    return image
+
+
+train_ds, valid_ds = load_datasets(BATCH_SIZE, BUFFER_SIZE)
+# iter = tf.compat.v1.data.make_one_shot_iterator(train_ds)
+# next = iter.get_next()
+# train_ds = next[0]
+# a = train_ds.map(lambda img, mask: img)
+print('train_ds', train_ds)
+print('valid_ds', valid_ds)
 
 # Setting seeds for reproducibility.
 SEED = 42
 tf.random.set_seed(SEED)
 # keras.utils.set_random_seed(SEED)
 
-# 设定超参数！！！！！！！！！！！！！！！
-BUFFER_SIZE = 1024
-BATCH_SIZE = 2
-AUTO = tf.data.AUTOTUNE
-INPUT_SHAPE = (32, 32, 3)
-NUM_CLASSES = 10
+# Set Parameters！！！！！！！！！！！！！！！
+# DATA
+INPUT_SHAPE = (288, 288, 1)
+# INPUT_SHAPE = (512,512)
+NUM_CLASSES = 7
 
 # OPTIMIZER
-LEARNING_RATE = 5e-3
-WEIGHT_DECAY = 1e-4
-# LEARNING_RATE = 5e-2
+# LEARNING_RATE = 5e-3
 # WEIGHT_DECAY = 1e-4
-
-# PRETRAINING
-EPOCHS = 100
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-5
 
 # AUGMENTATION
-IMAGE_SIZE = 512  # We will resize input images to this size.
+IMAGE_SIZE = 288  # We will resize input images to this size.
 PATCH_SIZE = 16  # Size of the patches to be extracted from the input images.
 NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2
-MASK_PROPORTION = 0  # We have found 75% masking to give us the best results.
+MASK_PROPORTION = 0.75  # We have found 75% masking to give us the best results.
 
-# ENCODER and DECODER
 LAYER_NORM_EPS = 1e-6
-ENC_PROJECTION_DIM = 12
-DEC_PROJECTION_DIM = 12
-ENC_NUM_HEADS = 4
+ENC_PROJECTION_DIM = 512
+DEC_PROJECTION_DIM = 16
+ENC_NUM_HEADS = 16
 ENC_LAYERS = 12
-DEC_NUM_HEADS = 4
+DEC_NUM_HEADS = 12
 DEC_LAYERS = (
-    3  # The decoder is lightweight but should be reasonably deep for reconstruction.
+    10  # The decoder is lightweight but should be reasonably deep for reconstruction.
 )
-# LAYER_NORM_EPS = 1e-6
-# ENC_PROJECTION_DIM = 256
-# DEC_PROJECTION_DIM = 128
-# ENC_NUM_HEADS = 8
-# ENC_LAYERS = 6
-# DEC_NUM_HEADS = 8
-# DEC_LAYERS = (
-#     8  # The decoder is lightweight but should be reasonably deep for reconstruction.
-# )
+
 ENC_TRANSFORMER_UNITS = [
     ENC_PROJECTION_DIM * 2,
     ENC_PROJECTION_DIM,
@@ -63,55 +141,7 @@ DEC_TRANSFORMER_UNITS = [
 ]
 
 
-# load dataset！！！！！！！！！！！！！！！
-
-(x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
-# x_train = x_train.astype('float32')
-# y_train = x_train.astype('float32')
-# x_test = x_train.astype('float32')
-# y_test = x_train.astype('float32')
-(x_train, y_train), (x_val, y_val) = (
-    (x_train[:40000], y_train[:40000]),
-    (x_train[40000:], y_train[40000:]),
-)
-print(f"Training samples: {len(x_train)}")
-print(f"Validation samples: {len(x_val)}")
-print(f"Testing samples: {len(x_test)}")
-
-
-train_ds = tf.data.Dataset.from_tensor_slices(x_train)
-train_ds = train_ds.shuffle(BUFFER_SIZE).batch(BATCH_SIZE).prefetch(AUTO)
-
-val_ds = tf.data.Dataset.from_tensor_slices(x_val)
-val_ds = val_ds.batch(BATCH_SIZE).prefetch(AUTO)
-
-test_ds = tf.data.Dataset.from_tensor_slices(x_test)
-test_ds = test_ds.batch(BATCH_SIZE).prefetch(AUTO)
-
-# imgs_train = np.load("D:/毕业设计程序/DATA/U-Net Train/b_trains.npy")
-# imgs_mask_train = np.load("D:/毕业设计程序/DATA/U-Net Train/b_masks.npy")
-# imgs_train = imgs_train.astype('float32')
-# imgs_mask_train = imgs_mask_train.astype('float32')
-# imgs_train /= 255
-# imgs_mask_train /= 255
-# imgs_mask_train[imgs_mask_train > 0.4] = 1
-# imgs_mask_train[imgs_mask_train <= 0.4] = 0
-# train_ds = imgs_train
-# mask_ds = imgs_mask_train
-# x_train = train_ds
-
-# def data_preprocess_model():
-#     model = keras.Sequential(
-#         [
-#             layers.experimental.preprocessing.Rescaling(1 / 255.0),
-#             layers.experimental.preprocessing.RandomCrop(IMAGE_SIZE, IMAGE_SIZE),
-#         ],
-#         name="data_preprocessing",
-#     )
-#     return model
-
-
-# extract patches！！！！！！！！！！！！！！！
+# 提取补丁！！！！！！！！！！！！！！！
 class Patches(layers.Layer):
     def __init__(self, patch_size=PATCH_SIZE, **kwargs):
         super().__init__(**kwargs)
@@ -119,97 +149,37 @@ class Patches(layers.Layer):
 
         # Assuming the image has three channels each patch would be
         # of size (patch_size, patch_size, 3).
-        self.resize = layers.Reshape((-1, patch_size * patch_size * 3))
+        # self.resize = layers.Reshape((-1, patch_size * patch_size * 3))
+        self.resize = layers.Reshape((-1, patch_size * patch_size))
 
-    def call(self, images):
-        # Create patches from the input images
-        patches = tf.image.extract_patches(
-            images=images,
+    def build(self, input_shape):
+        self.to_patch = CompatibleExtractPatches(
             sizes=[1, self.patch_size, self.patch_size, 1],
             strides=[1, self.patch_size, self.patch_size, 1],
             rates=[1, 1, 1, 1],
-            padding="VALID",
-        )
+            padding="VALID", )
+
+    def call(self, images):
+        # Create patches from the input images
+        # print('Patches-images', images)
+        # images=tf.reshape(images,[BATCH_SIZE,IMAGE_SIZE,IMAGE_SIZE,1])
+        print('Patches-images', images.shape)
+        patches = self.to_patch(images)
 
         # Reshape the patches to (batch, num_patches, patch_area) and return it.
         patches = self.resize(patches)
         return patches
 
-    def show_patched_image(self, images, patches):
-        # This is a utility function which accepts a batch of images and its
-        # corresponding patches and help visualize one image and its patches
-        # side by side.
-        idx = np.random.choice(patches.shape[0])
-        print(f"Index selected: {idx}.")
 
-        plt.figure(figsize=(4, 4))
-        plt.imshow(keras.preprocessing.image.array_to_img(images[idx]))
-        # plt.imshow(keras.utils.array_to_img(images[idx]))
-        plt.axis("off")
-        plt.show()
-
-        n = int(np.sqrt(patches.shape[1]))
-        plt.figure(figsize=(4, 4))
-        for i, patch in enumerate(patches[idx]):
-            ax = plt.subplot(n, n, i + 1)
-            patch_img = tf.reshape(patch, (self.patch_size, self.patch_size, 3))
-            plt.imshow(keras.preprocessing.image.img_to_array(patch_img))
-            # plt.imshow(keras.utils.img_to_array(patch_img))
-            plt.axis("off")
-        plt.show()
-
-        # Return the index chosen to validate it outside the method.
-        return idx
-
-    # taken from https://stackoverflow.com/a/58082878/10319735
-    def reconstruct_from_patch(self, patch):
-        # This utility function takes patches from a *single* image and
-        # reconstructs it back into the image. This is useful for the train
-        # monitor callback.
-        num_patches = patch.shape[0]
-        n = int(np.sqrt(num_patches))
-        patch = tf.reshape(patch, (num_patches, self.patch_size, self.patch_size, 3))
-        rows = tf.split(patch, n, axis=0)
-        rows = [tf.concat(tf.unstack(x), axis=1) for x in rows]
-        reconstructed = tf.concat(rows, axis=0)
-        return reconstructed
-
-
-# visualize patch！！！！！！！！！！！！！！！
-# # Get a batch of images.
-# image_batch = next(iter(train_ds))
-#
-# # Augment the images.
-# augmentation_model = get_train_augmentation_model()
-# augmented_images = augmentation_model(image_batch)
-# # augmented_images = image_batch
-#
-# # Define the patch layer.
-# patch_layer = Patches()
-#
-# # Get the patches from the batched images.
-# patches = patch_layer(images=augmented_images)
-#
-# # Now pass the images and the corresponding patches
-# # to the `show_patched_image` method.
-# random_index = patch_layer.show_patched_image(images=augmented_images, patches=patches)
-#
-# # Chose the same chose image and try reconstructing the patches
-# # into the original image.
-# image = patch_layer.reconstruct_from_patch(patches[random_index])
-# plt.imshow(image)
-# plt.axis("off")
-# plt.show()
-
-# add masks！！！！！！！！！！！！！！！
+# 加入掩码！！！！！！！！！！！！！！！
 class PatchEncoder(layers.Layer):
     def __init__(
-        self,
-        patch_size=PATCH_SIZE,
-        projection_dim=ENC_PROJECTION_DIM,
-        mask_proportion=MASK_PROPORTION,
-        downstream=False,
-        **kwargs,
+            self,
+            patch_size=PATCH_SIZE,
+            projection_dim=ENC_PROJECTION_DIM,
+            mask_proportion=MASK_PROPORTION,
+            downstream=False,
+            **kwargs,
     ):
         super().__init__(**kwargs)
         self.patch_size = patch_size
@@ -220,7 +190,8 @@ class PatchEncoder(layers.Layer):
         # This is a trainable mask token initialized randomly from a normal
         # distribution.
         self.mask_token = tf.Variable(
-            tf.random.normal([1, patch_size * patch_size * 3]), trainable=True
+            # tf.random.normal([1, patch_size * patch_size * 3]), trainable=True
+            tf.random.normal([1, patch_size * patch_size]), trainable=True
         )
 
     def build(self, input_shape):
@@ -247,9 +218,8 @@ class PatchEncoder(layers.Layer):
         )  # (B, num_patches, projection_dim)
 
         # Embed the patches.
-
         patch_embeddings = (
-            self.projection(patches) + pos_embeddings
+                self.projection(patches) + pos_embeddings
         )  # (B, num_patches, projection_dim)
 
         if self.downstream:
@@ -295,7 +265,7 @@ class PatchEncoder(layers.Layer):
             tf.random.uniform(shape=(batch_size, self.num_patches)), axis=-1
         )
         mask_indices = rand_indices[:, : self.num_mask]
-        unmask_indices = rand_indices[:, self.num_mask :]
+        unmask_indices = rand_indices[:, self.num_mask:]
         return mask_indices, unmask_indices
 
     def generate_masked_image(self, patches, unmask_indices):
@@ -313,54 +283,6 @@ class PatchEncoder(layers.Layer):
             new_patch[unmask_index[i]] = patch[unmask_index[i]]
         return new_patch, idx
 
-    # def generate_masked_image1(self, patches, unmask_indices, num):
-    #     # Choose a random patch and it corresponding unmask index.
-    #     # idx = np.random.choice(patches.shape[0])
-    #     idx = num
-    #     patch = patches[idx]
-    #     unmask_index = unmask_indices[idx]
-    #
-    #     # Build a numpy array of same shape as patch.
-    #     new_patch = np.zeros_like(patch)
-    #
-    #     # Iterate of the new_patch and plug the unmasked patches.
-    #     count = 0
-    #     for i in range(unmask_index.shape[0]):
-    #         new_patch[unmask_index[i]] = patch[unmask_index[i]]
-    #     return new_patch, idx
-
-# visualize masks！！！！！！！！！！！！！！！
-# # Create the patch encoder layer.
-# patch_encoder = PatchEncoder()
-#
-# # Get the embeddings and positions.
-# (
-#     unmasked_embeddings,
-#     masked_embeddings,
-#     unmasked_positions,
-#     mask_indices,
-#     unmask_indices,
-# ) = patch_encoder(patches=patches)
-#
-#
-# # Show a maksed patch image.
-# new_patch, random_index = patch_encoder.generate_masked_image(patches, unmask_indices)
-#
-# plt.figure(figsize=(10, 10))
-# plt.subplot(1, 2, 1)
-# img = patch_layer.reconstruct_from_patch(new_patch)
-# # plt.imshow(keras.utils.array_to_img(img))
-# plt.imshow(keras.preprocessing.image.array_to_img(img))
-# plt.axis("off")
-# plt.title("Masked")
-# plt.subplot(1, 2, 2)
-# img = augmented_images[random_index]
-# # plt.imshow(keras.utils.array_to_img(img))
-# plt.imshow(keras.preprocessing.image.array_to_img(img))
-# plt.axis("off")
-# plt.title("Original")
-# plt.show()
-
 
 # MLP！！！！！！！！！！！！！！！
 def mlp(x, dropout_rate, hidden_units):
@@ -369,18 +291,13 @@ def mlp(x, dropout_rate, hidden_units):
         x = layers.Dropout(dropout_rate)(x)
     return x
 
+
 # MAE Blocks！！！！！！！！！！！！！！！
 def create_encoder(num_heads=ENC_NUM_HEADS, num_layers=ENC_LAYERS):
-    # image_size = IMAGE_SIZE
-    # patch_size = PATCH_SIZE
-    aaa = int(IMAGE_SIZE/PATCH_SIZE)
-    bbb = int(PATCH_SIZE)*int(PATCH_SIZE)*3
-    # inputs = layers.Input((None, ENC_PROJECTION_DIM))
-    inputs = layers.Input(shape=(aaa*aaa, ENC_PROJECTION_DIM))
-    # inputs = layers.Input(shape=(4, ENC_PROJECTION_DIM))
+    inputs = layers.Input((None, ENC_PROJECTION_DIM))
     x = inputs
-    print('x',x.shape)
     hidden_states_out = []
+
     for _ in range(num_layers):
         # Layer normalization 1.
         x1 = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(x)
@@ -401,226 +318,17 @@ def create_encoder(num_heads=ENC_NUM_HEADS, num_layers=ENC_LAYERS):
 
         # Skip connection 2.
         x = layers.Add()([x3, x2])
-        x1 = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(x)
-        x1 = layers.Flatten()(x1)
-        x1 = layers.Dense(units=aaa * aaa * bbb, activation="sigmoid")(x1)
-        x1 = layers.Reshape((aaa, aaa, bbb))(x1)
+        x1 = x
         hidden_states_out.append(x1)
 
+    print('Encoder x', x.shape)
     outputs = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(x)
-
-    outputs = layers.Flatten()(outputs)
-    outputs = layers.Dense(units=aaa * aaa * bbb, activation="sigmoid")(outputs)
-    outputs = layers.Reshape((aaa, aaa, bbb))(outputs)
-
-    # hidden_states_out = layers.LayerNormalization(epsilon=LAYER_NORM_EPS)(hidden_states_out)
-    return keras.Model(inputs, [outputs,hidden_states_out], name="mae_encoder")
-
-# def create_decoder(num_heads=ENC_NUM_HEADS, num_layers=ENC_LAYERS):
-#     inputs = layers.Input((None, ENC_PROJECTION_DIM))
-
-
-
-
-
-
-# MAE Trainer！！！！！！！！！！！！！！！
-class MaskedAutoencoder(keras.Model):
-    def __init__(
-        self,
-        patch_layer,
-        patch_encoder,
-        encoder,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.patch_layer = patch_layer
-        self.patch_encoder = patch_encoder
-        self.encoder = encoder
-
-        self.en1 = UnetrBasicBlock(feature_size=64, kernel_size=3)
-        self.en2 = UnetrPrUpBlock(feature_size=128, kernel_size=3, num_layer=3, upsample_kernel_size=2)
-        self.en3 = UnetrPrUpBlock(feature_size=256, kernel_size=3, num_layer=2, upsample_kernel_size=2)
-        self.en4 = UnetrPrUpBlock(feature_size=512, kernel_size=3, num_layer=1, upsample_kernel_size=2)
-        self.de5 = UnetrUpBlock(feature_size=512, kernel_size=3, upsample_kernel_size=2)
-        self.de4 = UnetrUpBlock(feature_size=256, kernel_size=3, upsample_kernel_size=2)
-        self.de3 = UnetrUpBlock(feature_size=128, kernel_size=3, upsample_kernel_size=2)
-        self.de2 = UnetrUpBlock(feature_size=64, kernel_size=3, upsample_kernel_size=2)
-        self.out = tf.keras.Sequential([
-            layers.Conv2D(3, 1, activation='relu', padding='same', kernel_initializer='he_normal'),
-            layers.Conv2D(1, 1, activation = 'sigmoid'),
-        ])
-
-
-    def call(self, images):
-        # Patch the augmented images.
-        patches = self.patch_layer(images)
-        print(images)
-        print('images', images.shape)
-        print('patches', patches.shape)
-
-        # Encode the patches.
-        # (
-        #     unmasked_embeddings,
-        #     masked_embeddings,
-        #     unmasked_positions,
-        #     mask_indices,
-        #     unmask_indices,
-        # ) = self.patch_encoder(patches)
-        unmasked_embeddings = self.patch_encoder(patches)
-        print('unmasked_embeddings', unmasked_embeddings.shape)
-        # Pass the unmaksed patche to the encoder.
-        [encoder_outputs,hidden_states_out] = self.encoder(unmasked_embeddings)
-        print('encoder_outputs', encoder_outputs.shape)
-
-
-        enc1 = self.en1(images)
-        x2 = hidden_states_out[3]
-        print('x2', x2.shape)
-        print('hidden_states_out6', hidden_states_out[6].shape)
-        enc2 = self.en2(x2)
-        print('enc2', enc2.shape)
-        x3 = hidden_states_out[6]
-        enc3 = self.en3(x3)
-        print('enc3', enc3.shape)
-        x4 = hidden_states_out[9]
-        enc4 = self.en4(x4)
-        print('enc4', enc4.shape)
-        dec4 = encoder_outputs
-        dec3 = self.de5(dec4, enc4)
-        dec2 = self.de4(dec3, enc3)
-        dec1 = self.de3(dec2, enc2)
-        out = self.de2(dec1, enc1)
-        logits = self.out(out)
-        print('logits', logits.shape)
-        return logits
-
-    # def train_step(self, images):
-    #     with tf.GradientTape() as tape:
-    #         total_loss, loss_patch, loss_output = self.call(images)
-    #
-    #     # Apply gradients.
-    #     train_vars = [
-    #         self.patch_layer.trainable_variables,
-    #         self.patch_encoder.trainable_variables,
-    #         self.encoder.trainable_variables,
-    #         self.decoder.trainable_variables,
-    #     ]
-    #     grads = tape.gradient(total_loss, train_vars)
-    #     tv_list = []
-    #     for (grad, var) in zip(grads, train_vars):
-    #         for g, v in zip(grad, var):
-    #             tv_list.append((g, v))
-    #     self.optimizer.apply_gradients(tv_list)
-    #
-    #     # Report progress.
-    #     # print(loss_patch.dtype)
-    #     # print(loss_output.dtype)
-    #     self.compiled_metrics.update_state(loss_patch, loss_output)
-    #     return {m.name: m.result() for m in self.metrics}
-    #
-    # def test_step(self, images):
-    #     total_loss, loss_patch, loss_output = self.calculate_loss(images)
-    #
-    #     # Update the trackers.
-    #     self.compiled_metrics.update_state(loss_patch, loss_output)
-    #     return {m.name: m.result() for m in self.metrics}
-
-
-# model init！！！！！！！！！！！！！！！
-patch_layer = Patches()
-patch_encoder = PatchEncoder(downstream=True)
-encoder = create_encoder()
-
-mae_model = MaskedAutoencoder(
-    patch_layer=patch_layer,
-    patch_encoder=patch_encoder,
-    encoder=encoder,
-)
-
-
-# train callback！！！！！！！！！！！！！！！
-# Taking a batch of test inputs to measure model's progress.
-# test_images = next(iter(test_ds))
-
-
-
-# class TrainMonitor(keras.callbacks.Callback):
-#     def __init__(self, epoch_interval=None):
-#         self.epoch_interval = epoch_interval
-#
-#     def on_epoch_end(self, epoch, logs=None):
-#         # if self.epoch_interval and epoch % self.epoch_interval == 0:
-#         if epoch == 96:
-#             test_augmented_images = self.model.test_augmentation_model(test_images)
-#             test_patches = self.model.patch_layer(test_augmented_images)
-#             (
-#                 test_unmasked_embeddings,
-#                 test_masked_embeddings,
-#                 test_unmasked_positions,
-#                 test_mask_indices,
-#                 test_unmask_indices,
-#             ) = self.model.patch_encoder(test_patches)
-#             test_encoder_outputs = self.model.encoder(test_unmasked_embeddings)
-#             test_encoder_outputs = test_encoder_outputs + test_unmasked_positions
-#             test_decoder_inputs = tf.concat(
-#                 [test_encoder_outputs, test_masked_embeddings], axis=1
-#             )
-#             test_decoder_outputs = self.model.decoder(test_decoder_inputs)
-#
-#             # # Show a maksed patch image.
-#             # test_masked_patch, idx = self.model.patch_encoder.generate_masked_image(
-#             #     test_patches, test_unmask_indices
-#             # )
-#             # print(f"\nIdx chosen: {idx}")
-#             # original_image = test_augmented_images[idx]
-#             # masked_image = self.model.patch_layer.reconstruct_from_patch(
-#             #     test_masked_patch
-#             # )
-#             # reconstructed_image = test_decoder_outputs[idx]
-#
-#             for i in range(test_patches.shape[0]):
-#                 fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(15, 5))
-#                 ax[0].imshow(test_augmented_images[i])
-#                 ax[0].set_title(f"Original: {epoch:03d}")
-#                 ax[1].imshow(test_decoder_outputs[i])
-#                 ax[1].set_title(f"Resonstructed: {epoch:03d}")
-#                 # address = "/rds/general/user/cc721/home/MAE1/Result/pitch_4/" + str(i + 1) + ".jpg"
-#                 address = "D:/Imperial College London/BYSJ/CIFAR 10/Result/pitch_4/" + str(i + 1) + ".jpg"
-#
-#                 # address = "Z:/home/MAE1/Result/pitch_4/" + str(i + 1) + ".jpg"
-#                 plt.savefig(address)
-#                 # address1 = "./Result/pitch_8/" + str(i + 1) +".jpg"
-#                 # cv2.imwrite(address1, test_augmented_images[i])
-#                 # address1 = "./Result/pitch_8/" + str(i + 1) + "_p.jpg"
-#                 # cv2.imwrite(address1, test_decoder_outputs[i])
-#                 # print(f"\nIdx chosen: {i}")
-#                 plt.close(fig)
-#
-#
-#             # fig, ax = plt.subplots(nrows=1, ncols=4, figsize=(15, 5))
-#             # ax[0].imshow(original_image)
-#             # ax[0].set_title(f"Original: {epoch:03d}")
-#             #
-#             # ax[1].imshow(masked_image)
-#             # ax[1].set_title(f"Masked: {epoch:03d}")
-#             #
-#             # ax[2].imshow(reconstructed_image)
-#             # ax[2].set_title(f"Resonstructed: {epoch:03d}")
-#             #
-#             # ax[3].imshow(test_decoder_outputs[idx+1])
-#             # ax[3].set_title(f"Resonstructed: {epoch:03d}")
-#             #
-#             # plt.show()
-#             # plt.close()
-
-# Some code is taken from:
-# https://www.kaggle.com/ashusma/training-rfcx-tensorflow-tpu-effnet-b2.
+    return keras.Model(inputs, [outputs, hidden_states_out], name="mae_encoder")
 
 
 class WarmUpCosine(keras.optimizers.schedules.LearningRateSchedule):
     def __init__(
-        self, learning_rate_base, total_steps, warmup_learning_rate, warmup_steps
+            self, learning_rate_base, total_steps, warmup_learning_rate, warmup_steps
     ):
         super(WarmUpCosine, self).__init__()
 
@@ -648,8 +356,8 @@ class WarmUpCosine(keras.optimizers.schedules.LearningRateSchedule):
                     "warmup_learning_rate."
                 )
             slope = (
-                self.learning_rate_base - self.warmup_learning_rate
-            ) / self.warmup_steps
+                            self.learning_rate_base - self.warmup_learning_rate
+                    ) / self.warmup_steps
             warmup_rate = slope * tf.cast(step, tf.float32) + self.warmup_learning_rate
             learning_rate = tf.where(
                 step < self.warmup_steps, warmup_rate, learning_rate
@@ -659,70 +367,403 @@ class WarmUpCosine(keras.optimizers.schedules.LearningRateSchedule):
         )
 
 
-total_steps = int((len(x_train) / BATCH_SIZE) * EPOCHS)
-warmup_epoch_percentage = 0.15
-warmup_steps = int(total_steps * warmup_epoch_percentage)
-scheduled_lrs = WarmUpCosine(
-    learning_rate_base=LEARNING_RATE,
-    total_steps=total_steps,
-    warmup_learning_rate=0.0,
-    warmup_steps=warmup_steps,
-)
+class MaskedAutoencoder_down(keras.Model):
+    def __init__(
+            self,
+            patch_layer,
+            patch_encoder,
+            encoder,
+            **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.patch_layer = patch_layer
+        self.patch_encoder = patch_encoder
+        self.encoder = encoder
 
-lrs = [scheduled_lrs(step) for step in range(total_steps)]
-# plt.plot(lrs)
-# plt.xlabel("Step", fontsize=14)
-# plt.ylabel("LR", fontsize=14)
-# plt.show()
+        aaa = int(IMAGE_SIZE / PATCH_SIZE)
+        self.encoder_after = tf.keras.Sequential([
+            layers.LayerNormalization(epsilon=LAYER_NORM_EPS),
+            layers.Reshape((aaa, aaa, ENC_PROJECTION_DIM)),
+        ])
 
+        self.en1 = UnetrBasicBlock(feature_size=64, kernel_size=3)
+        self.en2 = UnetrPrUpBlock(feature_size=128, kernel_size=3, num_layer=2, upsample_kernel_size=2)
+        self.en3 = UnetrPrUpBlock(feature_size=256, kernel_size=3, num_layer=1, upsample_kernel_size=2)
+        self.en4 = UnetrPrUpBlock(feature_size=512, kernel_size=3, num_layer=0, upsample_kernel_size=2)
+        self.de5 = UnetrUpBlock(feature_size=512, kernel_size=3, upsample_kernel_size=2)
+        self.de4 = UnetrUpBlock(feature_size=256, kernel_size=3, upsample_kernel_size=2)
+        self.de3 = UnetrUpBlock(feature_size=128, kernel_size=3, upsample_kernel_size=2)
+        self.de2 = UnetrUpBlock(feature_size=64, kernel_size=3, upsample_kernel_size=2)
+        # self.out = tf.keras.Sequential([
+        #     layers.Conv2D(NUM_CLASSES, 1, padding = "same", kernel_initializer='he_normal'),
+        #     layers.Activation('sigmoid'),
+        # ])
+        self.out = tf.keras.Sequential([
+            layers.Conv2D(NUM_CLASSES, 1, padding="same", kernel_initializer='he_normal'),
+            layers.Activation('softmax'),
+        ])
+
+    def call(self, images):
+        patches = self.patch_layer(images)
+        print('images', images.shape)
+        print('patches', patches.shape)
+        unmasked_embeddings = self.patch_encoder(patches)
+        print('unmasked_embeddings', unmasked_embeddings.shape)
+        # Pass the unmaksed patche to the encoder.
+        [encoder_outputs, hidden_states_out] = self.encoder(unmasked_embeddings)
+        print('encoder_outputs', encoder_outputs.shape)
+        # print('hidden_states_out', hidden_states_out)
+
+        enc1 = self.en1(images)
+        x2 = self.encoder_after(hidden_states_out[3])
+        print('x2', x2.shape)
+        print('hidden_states_out6', self.encoder_after(hidden_states_out[6]).shape)
+        enc2 = self.en2(x2)
+        print('enc2', enc2.shape)
+        x3 = self.encoder_after(hidden_states_out[6])
+        enc3 = self.en3(x3)
+        print('enc3', enc3.shape)
+        x4 = self.encoder_after(hidden_states_out[9])
+        enc4 = self.en4(x4)
+        print('enc4', enc4.shape)
+        dec4 = self.encoder_after(encoder_outputs)
+        dec3 = self.de5(dec4, enc4)
+        dec2 = self.de4(dec3, enc3)
+        dec1 = self.de3(dec2, enc2)
+        out = self.de2(dec1, enc1)
+        logits = self.out(out)
+        print('logits', logits.shape)
+        return logits
+
+    def train_step(self, data):
+        images, mask = data
+        with tf.GradientTape() as tape:
+            mask_pre = self.call(images)
+            # loss = dice_coef_loss(mask, mask_pre)
+            loss = tversky_crossentropy(mask, mask_pre)
+
+        # train_vars = [
+        #     self.patch_layer.trainable_variables,
+        #     self.patch_encoder.trainable_variables,
+        #     self.encoder.trainable_variables,
+        #     self.encoder_after.trainable_variables,
+        #     self.en1.trainable_variables,
+        #     self.en2.trainable_variables,
+        #     self.en3.trainable_variables,
+        #     self.en4.trainable_variables,
+        #     self.de5.trainable_variables,
+        #     self.de4.trainable_variables,
+        #     self.de3.trainable_variables,
+        #     self.de2.trainable_variables,
+        #     self.out.trainable_variables,
+        # ]
+        # grads = tape.gradient(loss, train_vars)
+        # tv_list = []
+        # for (grad, var) in zip(grads, train_vars):
+        #     for g, v in zip(grad, var):
+        #         tv_list.append((g, v))
+        # self.optimizer.apply_gradients(tv_list)
+
+        trainable_vars = self.trainable_variables
+        gradients = tape.gradient(loss, trainable_vars)
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+
+        self.compiled_metrics.update_state(mask_pre, mask)
+        return {m.name: m.result() for m in self.metrics}
+
+    def test_step(self, data):
+        images, mask = data
+        mask_pre = self.call(images)
+        loss = dice_coef_loss(mask, mask_pre)
+
+        # Update the trackers.
+        self.compiled_metrics.update_state(mask_pre, mask)
+        return {m.name: m.result() for m in self.metrics}
 
 
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import math_ops
+import tensorflow.keras.backend as K
+
+
 def dice_coef(y_true, y_pred):
     y_pred = ops.convert_to_tensor_v2_with_dispatch(y_pred)
     y_true = math_ops.cast(y_true, y_pred.dtype)
-    y_true_f = keras.flatten(y_true)
-    y_pred_f = keras.flatten(y_pred)
-    intersection = keras.sum(y_true_f * y_pred_f)
-    return (2. * intersection + 1) / (keras.sum(y_true_f * y_true_f) + keras.sum(y_pred_f * y_pred_f) + 1)
+    y_true_f = K.flatten(y_true)
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return (2. * intersection + 1) / (K.sum(y_true_f * y_true_f) + K.sum(y_pred_f * y_pred_f) + 1)
 
 
 def dice_coef_loss(y_true, y_pred):
-    return 1-dice_coef(y_true, y_pred)
+    return -dice_coef(y_true, y_pred)
 
 
-# Assemble the callbacks.
-# train_callbacks = [TrainMonitor(epoch_interval=96)]
-# train_callbacks = [TrainMonitor1(epoch_interval=5)]
+def dice_coef_eval(y_true, y_pred):
+    y_true = tf.slice(y_true, [0, 0, 0, 1], [-1, -1, -1, 6])
+    y_pred = tf.slice(y_pred, [0, 0, 0, 1], [-1, -1, -1, 6])
+
+    dice = dice_coef(y_true, y_pred)
+
+    return dice
 
 
-optimizer = tfa.optimizers.AdamW(learning_rate=scheduled_lrs, weight_decay=WEIGHT_DECAY)
+def tversky_loss(y_true, y_pred, alpha=0.5, beta=0.5, smooth=1e-10):
+    """ Tversky loss function.
+    Parameters
+    ----------
+    y_true : tensor containing target mask.
+    y_pred : tensor containing predicted mask.
+    alpha : real value, weight of '0' class.
+    beta : real value, weight of '1' class.
+    smooth : small real value used for avoiding division by zero error.
+    Returns
+    -------
+    tensor
+        tensor containing tversky loss.
+    """
+    y_true = K.flatten(y_true)
+    y_pred = K.flatten(y_pred)
+    truepos = K.sum(y_true * y_pred)
+    fp_and_fn = alpha * K.sum(y_pred * (1 - y_true)) + beta * K.sum((1 - y_pred) * y_true)
+    answer = (truepos + smooth) / ((truepos + smooth) + fp_and_fn)
 
-# Compile and pretrain the model.
-mae_model.compile(
-    optimizer=optimizer, loss=dice_coef_loss, metrics=["mae"]
+    return 1 - answer
+
+
+def tversky_crossentropy(y_true, y_pred):
+    tversky = tversky_loss(y_true, y_pred)
+    crossentropy = K.categorical_crossentropy(y_true, y_pred)
+    crossentropy = K.mean(crossentropy)
+
+    return tversky + crossentropy
+
+
+with strategy.scope():
+    # 模型初始化！！！！！！！！！！！！！！！
+    patch_layer = Patches()
+    patch_encoder = PatchEncoder()
+    patch_encoder.downstream = True
+    encoder = create_encoder()
+
+    mae_seg = MaskedAutoencoder_down(
+        patch_layer=patch_layer,
+        patch_encoder=patch_encoder,
+        encoder=encoder,
+    )
+
+    # print('call', mae_seg(tf.random.normal(shape=[int(BATCH_SIZE/8), 288, 288, 1])))
+    a = mae_seg(tf.random.normal(shape=[int(BATCH_SIZE / 8), 288, 288, 1]))
+
+    checkpoint_filepath = "/home/caozi/Model_save/checkpoint_0.75.h5"
+    # mae_seg.load_weights(checkpoint_filepath, by_name = True, skip_mismatch=True)
+    # a = mae_seg.layers[3].get_weights()[0]
+    # print('weights', a)
+    mae_seg.load_weights(checkpoint_filepath, by_name=True)
+    # b = mae_seg.layers[3].get_weights()[0]
+    # print('weights', b)
+    # print('weight_cha', a-b)
+    # if linear == True:
+    # mae_seg.layers[0].trainable = False
+    # mae_seg.layers[1].trainable = False
+    # mae_seg.layers[2].trainable = False
+
+    # 训练callback！！！！！！！！！！！！！！！
+    # 可视化callback
+    # Taking a batch of test inputs to measure model's progress.
+    # test_images = next(iter(valid_ds))[0]
+    # # test_images = test_ds.take(1)
+    # print('test_images', test_images.shape)
+
+    # nnn = len(x_train)
+    nnn = 19200 * LESS_RATIO
+    total_steps = int((nnn / (BATCH_SIZE // 8)) * EPOCHS)
+    warmup_epoch_percentage = 0.15
+    warmup_steps = int(total_steps * warmup_epoch_percentage)
+    scheduled_lrs = WarmUpCosine(
+        learning_rate_base=LEARNING_RATE,
+        total_steps=total_steps,
+        warmup_learning_rate=0.0,
+        warmup_steps=warmup_steps,
+    )
+
+    lrs = [scheduled_lrs(step) for step in range(total_steps)]
+
+    # 模型编译与训练！！！！！！！！！！！！！！！
+    optimizer = tfa.optimizers.AdamW(learning_rate=scheduled_lrs, weight_decay=WEIGHT_DECAY)
+
+    # Compile and pretrain the model.
+    mae_seg.compile(
+        optimizer=optimizer, loss=tversky_crossentropy, metrics=[tversky_crossentropy]
+    )
+
+    # train_ds = strategy.experimental_distribute_dataset(train_ds)
+    # valid_ds = strategy.experimental_distribute_dataset(valid_ds)
+    # history = mae_model.fit(
+    #     train_ds, epochs=EPOCHS, validation_data=val_ds, callbacks=train_callbacks,
+    # )
+
+# from glob import glob
+# tfrec_dir = 'gs://oai-challenge-us/tfrecords/'
+# print(len(glob(os.path.join(tfrec_dir, 'train/*'))))
+# steps_per_epochh = len(glob(os.path.join(tfrec_dir, 'train/*'))) / (BATCH_SIZE)
+
+# print(np.sum([np.prod(v.get_shape().as_list()) for v in tf.compat.v1.trainable_variables()]))
+
+steps_per_epoch = (19200 * LESS_RATIO) // BATCH_SIZE
+validation_steps = 4480 // BATCH_SIZE
+print(steps_per_epoch)
+train_ds = strategy.experimental_distribute_dataset(train_ds)
+valid_ds = strategy.experimental_distribute_dataset(valid_ds)
+print(mae_seg.summary())
+history = mae_seg.fit(
+    train_ds, epochs=EPOCHS, steps_per_epoch=steps_per_epoch, validation_data=valid_ds,
+    validation_steps=validation_steps
 )
-# mae_model.compile(
-#     optimizer=optimizer, loss=keras.losses.MeanSquaredError(), metrics=["mae"]
-# )
-# history = mae_model.fit(
-#     train_ds, epochs=EPOCHS, validation_data=val_ds, callbacks=train_callbacks,
-# )
-history = mae_model.fit(
-    train_ds, epochs=EPOCHS, validation_data=val_ds,
-)
-# history = mae_model.fit(
-#     train_ds, mask_ds,  epochs=EPOCHS,
-# )
-
-# Measure its performance.
-# loss, mae = mae_model.evaluate(test_ds)
-# print(f"Loss: {loss:.2f}")
-# print(f"MAE: {mae:.2f}")
 
 
+def parse_tf_img(element):
+    image_feature_description = {
+        "width": tf.io.FixedLenFeature([], dtype=tf.int64),
+        "label_raw": tf.io.FixedLenFeature([], dtype=tf.string),
+        "image_raw": tf.io.FixedLenFeature([], dtype=tf.string),
+        "num_channels": tf.io.FixedLenFeature([], dtype=tf.int64),
+        "height": tf.io.FixedLenFeature([], dtype=tf.int64), }
+    parsed_example = tf.io.parse_single_example(element, image_feature_description)
+    width = parsed_example['width']
+    height = parsed_example['height']
+    num_channels = parsed_example['num_channels']
+    image = parsed_example['image_raw']
+    image = tf.compat.v1.decode_raw(image, tf.float32)
+    image = tf.reshape(image, [384, 384, 1])
+    mask = parsed_example['label_raw']
+    mask = tf.compat.v1.decode_raw(mask, tf.int16)
+    mask = tf.reshape(mask, [384, 384, 7])
+    image = tf.image.resize_with_crop_or_pad(image, 288, 288)
+    mask = tf.image.resize_with_crop_or_pad(mask, 288, 288)
+
+    return image, mask
 
 
+def load_data(data, pre_train='True'):
+    if data == 'Train':
+        train_dsds = np.zeros([19200, 288, 288, 1])
+        mask_dsds = np.zeros([19200, 288, 288, 7])
+        train_ds = np.ones([160, 288, 288, 1], dtype=float)
+        mask_ds = np.ones([160, 288, 288, 7], dtype=int)
+        for i in range(120):
+            print(i)
+            if i < 10:
+                train_tfr = 'gs://oai-challenge-us/tfrecords/train/00' + str(i) + '-of-119.tfrecords'
+            elif i < 100:
+                train_tfr = 'gs://oai-challenge-us/tfrecords/train/0' + str(i) + '-of-119.tfrecords'
+            else:
+                train_tfr = 'gs://oai-challenge-us/tfrecords/train/' + str(i) + '-of-119.tfrecords'
+            raw_train_dataset = tf.data.TFRecordDataset(train_tfr)
+            train_dataset = raw_train_dataset.map(parse_tf_img)
+            j = 0
+            for image, mask in train_dataset:
+                train_ds[j, :, :, :] = image.numpy()
+                mask_ds[j, :, :, :] = mask.numpy()
+                j = j + 1
+            train_dsds[i * 160:((i + 1) * 160), :, :, :] = train_ds
+            mask_dsds[i * 160:((i + 1) * 160), :, :, :] = mask_ds
+
+    elif data == 'Valid':
+        train_dsds = np.zeros([4480, 288, 288, 1])
+        mask_dsds = np.zeros([4480, 288, 288, 7])
+        train_ds = np.ones([160, 288, 288, 1], dtype=float)
+        mask_ds = np.ones([160, 288, 288, 7], dtype=int)
+        for i in range(28):
+            print(i)
+            if i < 10:
+                train_tfr = 'gs://oai-challenge-us/tfrecords/valid/00' + str(i) + '-of-027.tfrecords'
+            else:
+                train_tfr = 'gs://oai-challenge-us/tfrecords/valid/0' + str(i) + '-of-027.tfrecords'
+            raw_train_dataset = tf.data.TFRecordDataset(train_tfr)
+            train_dataset = raw_train_dataset.map(parse_tf_img)
+            j = 0
+            for image, mask in train_dataset:
+                train_ds[j, :, :, :] = image.numpy()
+                mask_ds[j, :, :, :] = mask.numpy()
+                j = j + 1
+            train_dsds[i * 160:((i + 1) * 160), :, :, :] = train_ds
+            mask_dsds[i * 160:((i + 1) * 160), :, :, :] = mask_ds
+    if pre_train == True:
+        return train_dsds
+    else:
+        return train_dsds, mask_dsds
 
 
+AUTO = tf.data.AUTOTUNE
+test_img, test_mask = load_data(data="Valid", pre_train=False)
+# print('test_img',test_img.shape)
+# print('test_mask',test_mask.shape)
+# test_img = tf.convert_to_tensor(test_img)
+# test_img = tf.cast(test_img, tf.float32)
+# test_img = tf.data.Dataset.from_tensor_slices(test_img)
+# test_img = test_img.batch(100).prefetch(AUTO)
+# print('test_img',test_img)
+
+# imgs_mask_test = mae_seg.predict(test_img, verbose=1)
+
+# for i in range(100):
+#     fig, ax = plt.subplots(nrows=2, ncols=8, figsize=(15, 5))
+#     ax[0, 0].imshow(test_img[i,:,:,:])
+#     ax[1, 0].imshow(test_img[i,:,:,:])
+#     ax[0, 1].imshow(test_mask[i,:,:,0])
+#     ax[1, 1].imshow(imgs_mask_test[i,:,:,0])
+#     ax[0, 2].imshow(test_mask[i,:,:,1])
+#     ax[1, 2].imshow(imgs_mask_test[i,:,:,1])
+#     ax[0, 3].imshow(test_mask[i,:,:,2])
+#     ax[1, 3].imshow(imgs_mask_test[i,:,:,2])
+#     ax[0, 4].imshow(test_mask[i,:,:,3])
+#     ax[1, 4].imshow(imgs_mask_test[i,:,:,3])
+#     ax[0, 5].imshow(test_mask[i,:,:,4])
+#     ax[1, 5].imshow(imgs_mask_test[i,:,:,4])
+#     ax[0, 6].imshow(test_mask[i,:,:,5])
+#     ax[1, 6].imshow(imgs_mask_test[i,:,:,5])
+#     ax[0, 7].imshow(test_mask[i,:,:,6])
+#     ax[1, 7].imshow(imgs_mask_test[i,:,:,6])
+#     address = "/home/caozi/Result/" + str(i) + ".jpg"
+#     plt.savefig(address)
+#     plt.close(fig)
+
+
+print('valid_ds', valid_ds)
+imgs_mask_test = mae_seg.predict(valid_ds, verbose=1, steps=validation_steps)
+print('imgs_mask_test', imgs_mask_test.shape)
+# for i in range(160):
+#     fig, ax = plt.subplots(nrows=2, ncols=7, figsize=(15, 5))
+#     ax[0, 0].imshow(test_img[i,:,:,:], cmap = 'gray')
+#     ax[1, 0].imshow(test_img[i,:,:,:], cmap = 'gray')
+#     ax[0, 1].imshow(test_mask[i,:,:,1], cmap = 'gray')
+#     ax[1, 1].imshow(imgs_mask_test[i,:,:,1], cmap = 'gray')
+#     ax[0, 2].imshow(test_mask[i,:,:,2], cmap = 'gray')
+#     ax[1, 2].imshow(imgs_mask_test[i,:,:,2], cmap = 'gray')
+#     ax[0, 3].imshow(test_mask[i,:,:,3], cmap = 'gray')
+#     ax[1, 3].imshow(imgs_mask_test[i,:,:,3], cmap = 'gray')
+#     ax[0, 4].imshow(test_mask[i,:,:,4], cmap = 'gray')
+#     ax[1, 4].imshow(imgs_mask_test[i,:,:,4], cmap = 'gray')
+#     ax[0, 5].imshow(test_mask[i,:,:,5], cmap = 'gray')
+#     ax[1, 5].imshow(imgs_mask_test[i,:,:,5], cmap = 'gray')
+#     ax[0, 6].imshow(test_mask[i,:,:,6], cmap = 'gray')
+#     ax[1, 6].imshow(imgs_mask_test[i,:,:,6], cmap = 'gray')
+#     # ax[0, 7].imshow(test_mask[i,:,:,0], vmin = 0, vmax = 0.005, cmap = 'gray')
+#     # ax[1, 7].imshow(imgs_mask_test[i,:,:,0], vmin = 0, vmax = 0.005, cmap = 'gray')
+#     address = "/home/caozi/Result/" + str(i) + ".jpg"
+#     plt.savefig(address)
+#     plt.close(fig)
+
+
+# imgs_mask_test = mae_seg.predict(valid_ds, verbose=1, steps=validation_steps)
+# print('imgs_mask_test', imgs_mask_test.shape)
+# for i in range(100):
+#     fig, ax = plt.subplots(figsize=(15, 5))
+#     plt.imshow(imgs_mask_test[i,:,:,:])
+#     address = "/home/caozi/Result/" + str(i) + ".jpg"
+#     plt.savefig(address)
+#     plt.close(fig)
+
+dice = dice_coef_eval(imgs_mask_test, test_mask)
+print(dice)
